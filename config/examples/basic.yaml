@@ -1,0 +1,19 @@
+apiVersion: streaming.benthos.dev/v1alpha1
+kind: BenthosPipeline
+metadata:
+  name: benthospipeline-sample
+spec:
+  replicas: 2
+  config: |
+    input:
+      generate:
+        mapping: root = "woof"
+        interval: 5s
+        count: 0
+
+    pipeline:
+      processors:
+        - mapping: root = content().uppercase()
+
+    output:
+      stdout: {}

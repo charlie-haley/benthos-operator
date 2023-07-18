@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- streaming_v1alpha1_benthospipeline.yaml
+#+kubebuilder:scaffold:manifestskustomizesamples
