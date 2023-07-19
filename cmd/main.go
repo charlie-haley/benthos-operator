@@ -29,6 +29,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	streamingv1alpha1 "github.com/charlie-haley/benthos-operator/api/v1alpha1"
@@ -42,6 +43,7 @@ var (
 )
 
 func init() {
+	log.SetLogger(zap.New())
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(streamingv1alpha1.AddToScheme(scheme))

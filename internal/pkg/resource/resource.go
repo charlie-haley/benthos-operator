@@ -37,44 +37,27 @@ func NewDeployment(name string, namespace string, replicas int32) *appsv1.Deploy
 						}},
 						Args: []string{
 							"-c",
-							"/benthos.yaml",
-							"streams",
-							"streams/*.yaml",
+							"/config/benthos.yaml",
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{
-								Name:      "streams",
-								MountPath: "/streams",
+								Name:      "config",
+								MountPath: "/config",
 								ReadOnly:  true,
 							},
-							// {
-							// 	Name:      "config",
-							// 	MountPath: "/config",
-							// 	ReadOnly:  true,
-							// },
 						},
 					}},
 					Volumes: []corev1.Volume{
 						{
-							Name: "streams",
+							Name: "config",
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
 									LocalObjectReference: corev1.LocalObjectReference{
-										Name: "benthos-streams" + name,
+										Name: "benthos-" + name,
 									},
 								},
 							},
 						},
-						// {
-						// 	Name: "config",
-						// 	VolumeSource: corev1.VolumeSource{
-						// 		ConfigMap: &corev1.ConfigMapVolumeSource{
-						// 			LocalObjectReference: corev1.LocalObjectReference{
-						// 				Name: "benthos-config" + name,
-						// 			},
-						// 		},
-						// 	},
-						// },
 					},
 				},
 			},
