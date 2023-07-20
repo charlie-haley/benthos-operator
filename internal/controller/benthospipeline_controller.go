@@ -2,12 +2,13 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -50,9 +51,6 @@ func (r *BenthosPipelineReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	pipeline := &streamv1.BenthosPipeline{}
 	err := r.Get(ctx, req.NamespacedName, pipeline)
 	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			return reconcile.Result{}, nil
-		}
 		return reconcile.Result{}, err
 	}
 
@@ -78,13 +76,7 @@ func (r *BenthosPipelineReconciler) reconcileNormal(scope *PipelineScope) (ctrl.
 	controllerutil.AddFinalizer(scope.Pipeline, streamv1.PipelineFinalizer)
 
 	// check if the Pipeline has already created a deployment
-	_, err := r.createOrUpdateDeployment(scope)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// set status
-	_, err = r.updatePipelineStatus(scope)
+	_, err := r.createOrUpdatePipeline(scope)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -112,16 +104,15 @@ func (r *BenthosPipelineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // createOrUpdatePipeline orchestrates the updating and creation of the Benthos deployment
 func (r *BenthosPipelineReconciler) createOrUpdatePipeline(scope *PipelineScope) (ctrl.Result, error) {
 	pipeline := scope.Pipeline
-	replicas := pipeline.Spec.Replicas
 
 	// create Benthos ConfigMap
-	_, err := r.createOrUpdateConfigMap(scope)
+	_, err := r.createOrPatchConfigMap(scope)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
 	// create Benthos Deployment
-	_, err = r.createOrUpdateDeployment(scope)
+	_, err = r.createOrPatchDeployment(scope)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -133,29 +124,73 @@ func (r *BenthosPipelineReconciler) createOrUpdatePipeline(scope *PipelineScope)
 		return reconcile.Result{}, errors.Wrapf(err, "failed to get deployment", "deployment", pipeline.Name)
 	}
 
+	// set pipeline phase if not set
+	if pipeline.Status.Phase == "" {
+		scope.status(false, "Provisioning")
+	}
+
 	// Update available replicas on the status
 	scope.Log.Info("Found deployment", "status", deployment.Status)
+	return r.setPipelineStatus(scope, deployment)
+}
+
+// setPipelineStatus gets the latest status of the deployment
+func (r *BenthosPipelineReconciler) setPipelineStatus(scope *PipelineScope, deployment *appsv1.Deployment) (res ctrl.Result, resErr error) {
+	// defer applying the status change
+	defer func() {
+		scope.Log.Info("Setting BenthosPipeline status.", "ready", scope.Pipeline.Status.Ready, "phase", scope.Pipeline.Status.Phase)
+
+		err := r.Status().Update(context.Background(), scope.Pipeline)
+		if err != nil {
+			resErr = err
+		}
+	}()
+
+	status := deployment.Status
+	replicas := scope.Pipeline.Spec.Replicas
+
+	// set available replicas on the pipeline
 	scope.Pipeline.Status.AvailableReplicas = deployment.Status.AvailableReplicas
 
-	// Decide what Phase and Ready condition to set on the BenthosPipeline status
-	if deployment.Status.ReadyReplicas == replicas {
-		scope.status(true, "Running")
-		return reconcile.Result{}, nil
-	}
-	if deployment.Status.ReadyReplicas > replicas {
-		scope.status(true, "Scaling down")
-		return reconcile.Result{}, nil
-	}
-	if deployment.Status.UnavailableReplicas == replicas {
+	available := getConditionStatus(status, appsv1.DeploymentAvailable) == corev1.ConditionTrue
+	progressing := getConditionStatus(status, appsv1.DeploymentProgressing) == corev1.ConditionTrue
+
+	// how long since deployment creation before reporting an error.
+	failedDelay := time.Second * 30
+	if !available && deployment.Status.UnavailableReplicas == replicas && deployment.CreationTimestamp.Sub(time.Now()) > failedDelay {
 		scope.status(false, "Deployment failed")
-		return reconcile.Result{}, errors.New("Deployment failed")
-	}
-	if deployment.Status.ReadyReplicas < replicas {
-		scope.status(true, "Scaling up")
-		return reconcile.Result{}, nil
+		return reconcile.Result{}, errors.New("One or more pods failed to start. Check the logs of the pods.")
 	}
 
+	if progressing {
+		if deployment.Status.UpdatedReplicas != replicas {
+			scope.status(true, "Updating")
+			return reconcile.Result{}, nil
+		}
+		if deployment.Status.ReadyReplicas > replicas {
+			scope.status(true, "Scaling down")
+			return reconcile.Result{}, nil
+		}
+		if deployment.Status.ReadyReplicas < replicas {
+			scope.status(true, "Scaling up")
+			return reconcile.Result{}, nil
+		}
+	}
+
+	if available {
+		scope.status(true, "Running")
+	}
 	return reconcile.Result{}, nil
+}
+
+func getConditionStatus(ds appsv1.DeploymentStatus, condition appsv1.DeploymentConditionType) corev1.ConditionStatus {
+	for i := range ds.Conditions {
+		c := ds.Conditions[i]
+		if c.Type == condition {
+			return c.Status
+		}
+	}
+	return corev1.ConditionUnknown
 }
 
 // status is a wrapper for settings the pipeline status options
@@ -164,14 +199,16 @@ func (ps *PipelineScope) status(ready bool, phase string) {
 	ps.Pipeline.Status.Phase = phase
 }
 
-// createOrUpdateDeployment updates a benthos deployment or creates it if it doesn't exist
-func (r *BenthosPipelineReconciler) createOrUpdateDeployment(scope *PipelineScope) (ctrl.Result, error) {
+// createOrPatchDeployment updates a benthos deployment or creates it if it doesn't exist
+func (r *BenthosPipelineReconciler) createOrPatchDeployment(scope *PipelineScope) (ctrl.Result, error) {
 	name := scope.Pipeline.Name
 	namespace := scope.Pipeline.Namespace
 	replicas := scope.Pipeline.Spec.Replicas
 
+	scope.Log.Info("Creating deployment", "name", name)
+
 	dp := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
-	op, err := controllerutil.CreateOrUpdate(scope.Ctx, scope.Client, dp, func() error {
+	op, err := controllerutil.CreateOrPatch(scope.Ctx, scope.Client, dp, func() error {
 		template := resource.NewDeployment(name, namespace, replicas)
 
 		// Deployment selector is immutable we only change this value if we're creating a new resource.
@@ -179,10 +216,11 @@ func (r *BenthosPipelineReconciler) createOrUpdateDeployment(scope *PipelineScop
 			dp.Spec.Selector = &metav1.LabelSelector{
 				MatchLabels: template.Spec.Selector.MatchLabels,
 			}
+			dp.Spec.Template.ObjectMeta = template.Spec.Template.ObjectMeta
 		}
 
-		// Update the template
-		dp.Spec.Template = template.Spec.Template
+		// Update the template, ignore metadata
+		dp.Spec.Template.Spec = template.Spec.Template.Spec
 		dp.Spec.Replicas = template.Spec.Replicas
 
 		err := controllerutil.SetControllerReference(scope.Pipeline, dp, r.Scheme)
@@ -192,7 +230,6 @@ func (r *BenthosPipelineReconciler) createOrUpdateDeployment(scope *PipelineScop
 
 		return nil
 	})
-
 	if err != nil {
 		return reconcile.Result{}, errors.Wrapf(err, "Failed to reconcile deployment", "name", name)
 	}
@@ -200,38 +237,50 @@ func (r *BenthosPipelineReconciler) createOrUpdateDeployment(scope *PipelineScop
 	return reconcile.Result{}, nil
 }
 
-// createOrUpdateConfigMap updates a config map or creates it if it doesn't exist
-func (r *BenthosPipelineReconciler) createOrUpdateConfigMap(scope *PipelineScope) (ctrl.Result, error) {
+// createOrPatchConfigMap updates a config map or creates it if it doesn't exist
+func (r *BenthosPipelineReconciler) createOrPatchConfigMap(scope *PipelineScope) (ctrl.Result, error) {
 	name := scope.Pipeline.Name
 
+	scope.Log.Info("Creating config map", "name", name)
+
 	sc := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "benthos-" + name, Namespace: scope.Pipeline.Namespace}}
-	op, err := controllerutil.CreateOrUpdate(scope.Ctx, scope.Client, sc, func() error {
+	op, err := controllerutil.CreateOrPatch(scope.Ctx, scope.Client, sc, func() error {
 		sc.Data = map[string]string{
 			"benthos.yaml": scope.Pipeline.Spec.Config,
 		}
 		err := controllerutil.SetControllerReference(scope.Pipeline, sc, r.Scheme)
 		if err != nil {
-			return errors.Wrapf(err, "Failed to set controller reference on deployment", "name", name)
+			return errors.Wrapf(err, "Failed to set controller reference on configmap", "name", name)
 		}
 		return nil
 	})
-
 	if err != nil {
 		return reconcile.Result{}, errors.Wrapf(err, "Failed to reconcile config map", "name", name)
 	}
+
 	scope.Log.Info("Succesfully reconciled config map", "name", name, "operation", op)
+
+	if op == controllerutil.OperationResultUpdated {
+		return r.rolloutDeployment(scope)
+	}
 
 	return reconcile.Result{}, nil
 }
 
-// updatePipelineStatus updates the status of the BenthosPipeline custom resource
-func (r *BenthosPipelineReconciler) updatePipelineStatus(scope *PipelineScope) (ctrl.Result, error) {
-	pipeline := scope.Pipeline
-	scope.Log.Info("Setting BenthosPipeline status.", "ready", pipeline.Status.Ready, "phase", pipeline.Status.Phase)
+// rolloutDeployment rolls out a new Benthos deployment
+func (r *BenthosPipelineReconciler) rolloutDeployment(scope *PipelineScope) (ctrl.Result, error) {
+	name := scope.Pipeline.Name
+	namespace := scope.Pipeline.Namespace
 
-	err := r.Status().Update(context.Background(), pipeline)
+	scope.Log.Info("Rolling out deployment.", "name", name)
+
+	dp := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
+	body := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"%s":"%s"}}}}}`, "streaming.benthos.dev/restartedAt", time.Now().Format(time.RFC3339))
+	err := r.Patch(scope.Ctx, dp, client.RawPatch(types.StrategicMergePatchType, []byte(body)))
 	if err != nil {
-		return reconcile.Result{}, err
+		return reconcile.Result{}, errors.Wrapf(err, "Failed to rollout deployment", "name", name)
 	}
+
+	scope.Log.Info("Deployment rollout success", "name", name)
 	return reconcile.Result{}, nil
 }

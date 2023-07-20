@@ -3,7 +3,7 @@ kind: BenthosPipeline
 metadata:
   name: benthospipeline-sample
 spec:
-  replicas: 2
+  replicas: 10
   config: |
     input:
       generate:
