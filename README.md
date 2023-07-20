@@ -59,4 +59,4 @@ benthospipeline-sample   true    Updating   15         12          61m
 
 ## Contributing
 
-If you'd like to contribute, [please take a look at our outstanding issues](https://github.com/charlie-haley/flowcontrol/issues)
+If you'd like to contribute, [please take a look at our outstanding issues](https://github.com/charlie-haley/benthos-operator/issues)
